@@ -2,7 +2,6 @@ package goriak
 
 import (
 	"errors"
-	"log"
 	"reflect"
 	"strconv"
 	"strings"
@@ -12,7 +11,7 @@ import (
 )
 
 func TsQuery(query string, session *Session) error {
-	cmd, err := riak.NewTsQueryCommandBuilder().WithQuery(``).Build()
+	cmd, err := riak.NewTsQueryCommandBuilder().WithQuery(query).Build()
 	if err != nil {
 		return err
 	}
@@ -40,7 +39,6 @@ func TsWrite(table string, object interface{}, session *Session) error {
 	num := r.NumField()
 	for i := 0; i < num; i++ {
 		tag := r.Field(i).Tag.Get("goriakts")
-		log.Println(tag)
 		tagPiece := strings.Split(tag, ",")
 
 		if len(tagPiece) != 2 {
@@ -76,10 +74,10 @@ func TsWrite(table string, object interface{}, session *Session) error {
 			if ts, ok := f.Interface().(time.Time); ok {
 				row[tsCellID] = riak.NewTimestampTsCell(ts)
 			} else {
-				log.Println("Unknown Type:", r.Field(fieldID).Type.Kind())
+				return errors.New("Unknown Type in TsWrite: " + r.Field(fieldID).Type.Kind().String())
 			}
 		default:
-			log.Println("Unknown Type:", r.Field(fieldID).Type.Kind())
+			return errors.New("Unknown Type in TsWrite: " + r.Field(fieldID).Type.Kind().String())
 		}
 	}
 
@@ -103,81 +101,92 @@ func TsWrite(table string, object interface{}, session *Session) error {
 	return nil
 }
 
-func TsRead(query string, objects []interface{}, session *Session) error {
+func TsTimeFormat(in time.Time) int64 {
+	return riak.ToUnixMillis(in)
+}
+
+func TsRead(query string, objects interface{}, session *Session) error {
+
+	ptrValue := reflect.ValueOf(objects)
+	ptrOuterType := reflect.TypeOf(objects)
+
+	if ptrOuterType.Kind() != reflect.Ptr {
+		return errors.New("objects is expected to be of ptr slice struct type (outer was not slice). Was: " + ptrOuterType.Kind().String())
+	}
+
+	sliceOuterType := ptrOuterType.Elem()
+	sliceValue := ptrValue.Elem()
+	if sliceOuterType.Kind() != reflect.Slice {
+		return errors.New("objects is expected to be of ptr slice struct type (outer was not slice). Was: " + sliceOuterType.Kind().String())
+	}
+
+	innerType := ptrOuterType.Elem().Elem()
+	if innerType.Kind() != reflect.Struct {
+		return errors.New("objects is expected to be of slice struct type (slice type was not struct)")
+	}
+
+	// Map field names (from the goriakts tag) to their field position
+	fieldNameToPos := make(map[string]int)
+	numField := innerType.NumField()
+
+	for i := 0; i < numField; i++ {
+		tag := innerType.Field(i).Tag.Get("goriakts")
+		tagPieces := strings.Split(tag, ",")
+
+		if len(tagPieces) != 2 {
+			return errors.New("Unexpected value of the goriakts tag on " + innerType.String() + ":" + innerType.Field(i).Name)
+		}
+
+		fieldNameToPos[tagPieces[1]] = i
+	}
+
+	cmd, err := riak.NewTsQueryCommandBuilder().WithQuery(query).Build()
+	if err != nil {
+		return err
+	}
+
+	err = session.riak.Execute(cmd)
+	if err != nil {
+		return err
+	}
+
+	res := cmd.(*riak.TsQueryCommand)
+
+	if !res.Success() {
+		return errors.New("Query was not successfully executed")
+	}
+
+	// Create a new slice
+	outputSlice := reflect.MakeSlice(sliceOuterType, len(res.Response.Rows), len(res.Response.Rows))
+
+	for rowID, row := range res.Response.Rows {
+
+		// Create a new struct
+		newOutObject := reflect.New(innerType).Elem()
+
+		for colID, data := range row {
+			colName := res.Response.Columns[colID].GetName()
+			if pos, ok := fieldNameToPos[colName]; ok {
+				switch data.GetDataType() {
+				case "VARCHAR":
+					newOutObject.Field(pos).SetString(data.GetStringValue())
+				case "SINT64":
+					newOutObject.Field(pos).SetInt(data.GetSint64Value())
+				case "TIMESTAMP":
+					newOutObject.Field(pos).Set(reflect.ValueOf(data.GetTimeValue()))
+				default:
+					return errors.New("Unknown type " + data.GetDataType() + " in result parsing")
+				}
+			} else {
+				return errors.New("Could not map " + colName + " to output object")
+			}
+		}
+
+		outputSlice.Index(rowID).Set(newOutObject)
+	}
+
+	// Replace the user subbmited slice with the one that we have created
+	sliceValue.Set(outputSlice)
+
 	return nil
 }
-
-/*func TSWrite(session *Session) {
-	row := []riak.TsCell{
-		riak.NewSint64TsCell(100),
-		riak.NewStringTsCell("Foo"),
-		riak.NewTimestampTsCell(time.Now()),
-	}
-
-	cmd, err := riak.NewTsStoreRowsCommandBuilder().
-		WithTable("UserLog").
-		WithRows([][]riak.TsCell{row}).
-		Build()
-	if err != nil {
-		panic(err)
-	}
-
-	err = session.riak.Execute(cmd)
-	if err != nil {
-		panic(err)
-	}
-
-	log.Printf("%+v", cmd)
-	log.Printf("%+v", cmd.(*riak.TsStoreRowsCommand))
-}
-
-func TSRead(session *Session) {
-	q := fmt.Sprintf(`SELECT id, action, time
-        FROM UserLog
-        WHERE id = 100
-        AND time > %d
-        AND time <= %d`,
-		riak.ToUnixMillis(time.Now().Add(-time.Second*10)),
-		riak.ToUnixMillis(time.Now()))
-
-	log.Println(q)
-
-	cmd, err := riak.NewTsQueryCommandBuilder().WithQuery(q).Build()
-	if err != nil {
-		panic(err)
-	}
-
-	err = session.riak.Execute(cmd)
-	if err != nil {
-		panic(err)
-	}
-
-	res := cmd.(*riak.TsQueryCommand).Response
-
-	log.Printf("%+v", cmd)
-	log.Printf("%+v", res)
-	log.Printf("%+v", cmd.(*riak.TsQueryCommand).Success())
-
-	for _, c := range res.Columns {
-		log.Printf("%+v %+v", c.GetName(), c.GetType())
-	}
-
-	for _, row := range res.Rows {
-		log.Printf("%+v", row)
-		for _, r := range row {
-			switch r.GetDataType() {
-			case "SINT64":
-				log.Printf("%+v %+v", r.GetDataType(), r.GetSint64Value())
-			case "VARCHAR":
-				log.Printf("%+v %+v", r.GetDataType(), r.GetStringValue())
-			case "TIMESTAMP":
-				log.Printf("%+v %+v %+v", r.GetDataType(), r.GetTimeValue(), r.GetTimeValue().UnixNano())
-				log.Printf("%+v %+v", r.GetDataType(), r.GetTimestampValue())
-			default:
-				log.Printf("%+v", r.GetDataType())
-			}
-
-		}
-	}
-}
-*/
